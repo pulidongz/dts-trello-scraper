@@ -28,23 +28,19 @@ class TrelloScraper
   LAST_BOARD_FILE = File.join(Dir.pwd, 'last_board.txt')
 
   def initialize
-    # Check required environment variables
     %w[OPENAI_API_KEY TRELLO_API_KEY TRELLO_API_TOKEN].each do |key|
       unless ENV[key]
         puts "Error: #{key} not found in .env file"
-        puts "Please create a .env file with your #{key} like this:"
-        puts "#{key}=your-key-here"
         exit 1
       end
     end
 
-    # Create logs directory if it doesn't exist
     FileUtils.mkdir_p(File.dirname(ERROR_LOG_FILE_PATH))
-
-    # Truncate the error log file
     File.write(ERROR_LOG_FILE_PATH, '')
 
     setup_database
+
+    @openai_client = OpenAI::Client.new(access_token: ENV['OPENAI_API_KEY'], log_errors: true)
   end
 
   def run
@@ -94,6 +90,18 @@ class TrelloScraper
         id TEXT PRIMARY KEY,
         card_id TEXT,
         text TEXT,
+        FOREIGN KEY(card_id) REFERENCES cards(id)
+      );
+    SQL
+
+    @db.execute <<-SQL
+      CREATE TABLE IF NOT EXISTS contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        location TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        UNIQUE (card_id, name, location, phone)
         FOREIGN KEY(card_id) REFERENCES cards(id)
       );
     SQL
@@ -158,6 +166,7 @@ class TrelloScraper
             ])
           end
 
+          scan_for_contacts(card)
           list_progress.increment
         rescue StandardError => e
           log_error("Failed to process card: #{board.id} -> #{list.id} -> #{card.id}: #{e.message}")
@@ -171,10 +180,91 @@ class TrelloScraper
     puts "Failed to scrape board. Please try again."
   end
 
+  def scan_for_contacts(card)
+    data_to_scan = [card.name, card.desc]
+
+    @db.execute("SELECT text FROM comments WHERE card_id = ?", [card.id]).each do |row|
+      data_to_scan << row.first
+    end
+
+    data_to_scan.compact!
+
+    extracted_contacts = []
+
+    data_to_scan.each do |text|
+      begin
+        response = @openai_client.chat(
+          parameters: {
+            model: 'gpt-4o-mini',
+            response_format: { type: 'json_object' },
+            messages: [
+              {
+                role: 'system',
+                content: "You are an assistant that extracts structured information."
+              },
+              {
+                role: 'user',
+                content: "Extract name, location, and phone from the following text:\n#{text}. Respond in JSON format."
+              }
+            ],
+            max_tokens: 100
+          }
+        )
+
+        content = response.dig('choices', 0, 'message', 'content')
+        return nil unless content
+
+        data = JSON.parse(content, symbolize_names: true) rescue nil
+        unless data
+          log_error("Failed to parse JSON for card #{card.id}. Content: #{content}")
+          next
+        end
+
+        # Validate extracted data and skip or log errors as necessary
+        if data[:phone].to_s.strip.empty? ||
+            data[:name].to_s.strip.empty? ||
+            data[:location].to_s.strip.empty? ||
+            [data[:name], data[:location], data[:phone]].any? { |field| %w[N/A not provided Not specified].include?(field.to_s.strip) }
+          log_error("Skipping invalid or incomplete record for card #{card.id}. Extracted data: #{data.inspect}")
+          next
+        end
+
+        # Check for duplicates
+        existing_contact = @db.get_first_row("SELECT * FROM contacts WHERE card_id = ? AND name = ? AND location = ? AND phone = ?", [
+          card.id, data[:name].strip, data[:location].strip, data[:phone].strip
+        ])
+        if existing_contact
+          log_error("Skipping duplicate record for card #{card.id}. Extracted data: #{data.inspect}")
+          next
+        end
+
+        # Add to extracted_contacts if all fields are valid
+        extracted_contacts << [card.id, data[:name].strip, data[:location].strip, data[:phone].strip]
+      rescue StandardError => e
+        log_error("Error scanning card #{card.id}. Text: #{text}. Error: #{e.message}")
+      end
+    end
+
+    # Insert contacts in bulk if valid records exist
+    if extracted_contacts.any?
+      @db.execute("BEGIN TRANSACTION;")
+      begin
+        extracted_contacts.each do |contact|
+          @db.execute("INSERT INTO contacts (card_id, name, location, phone) VALUES (?, ?, ?, ?)", contact)
+        end
+        @db.execute("COMMIT;")
+      rescue StandardError => e
+        @db.execute("ROLLBACK;")
+        log_error("Database insertion failed for card #{card.id}: #{e.message}")
+      end
+    end
+  end
+
   def truncate_database
     @db.execute("DELETE FROM lists;")
     @db.execute("DELETE FROM cards;")
     @db.execute("DELETE FROM comments;")
+    @db.execute("DELETE FROM contacts;")
   end
 
   def save_last_board(board_id)
@@ -188,7 +278,6 @@ class TrelloScraper
   end
 
   def log_error(message)
-    warn("#{message}\n")
     File.open(ERROR_LOG_FILE_PATH, 'a') { |file| file.puts(message) }
   end
 end
