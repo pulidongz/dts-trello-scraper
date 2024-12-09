@@ -44,22 +44,20 @@ class TrelloScraper
   end
 
   def run
-    loop do
-      puts 'Enter the name of the board you want to scrape, or press L to list all boards. Press Enter to exit.'
-      user_input = gets.chomp.strip
+    boards = list_boards
+    puts 'Enter the number of the board you want to scrape, or press Enter to exit.'
+    user_input = gets.chomp.strip
 
-      case user_input.downcase
-      when 'l'
-        list_boards
-        puts 'Enter the name or ID of the board you want to scrape, or press Enter to exit.'
-        board_input = gets.chomp.strip
-        process_board(board_input)
-      when ''
-        puts 'Exiting script.'
-        exit
-      else
-        process_board(user_input)
-      end
+    if user_input.empty?
+      puts 'Exiting script.'
+      exit
+    end
+
+    board_index = user_input.to_i - 1
+    if board_index.between?(0, boards.size - 1)
+      process_board(boards[board_index].id)
+    else
+      puts 'Invalid selection. Please try again.'
     end
   end
 
@@ -108,32 +106,26 @@ class TrelloScraper
   end
 
   def list_boards
-    puts "\nFetching boards..."
+    puts "\nFetching boards...\n"
     boards = Trello::Board.all
-    boards.each do |board|
-      puts "Board Name: #{board.name}, ID: #{board.id}"
+    boards.each_with_index do |board, index|
+      puts "#{index + 1}. Board Name: #{board.name}"
     end
   rescue StandardError => e
     log_error("Error listing boards: #{e.message}")
     puts "\nFailed to fetch boards. Please check your API keys and try again."
   end
 
-  def process_board(board_input)
-    board = find_board_by_name_or_id(board_input)
-
-    if board
-      if last_board_stored == board.id
-        puts "\nUsing last stored board: #{board.name}"
-        scrape_board(board, update: true)
-      else
-        puts "\nNew board selected: #{board.name}. Truncating database."
-        truncate_database
-        save_last_board(board.id)
-        scrape_board(board)
-      end
+  def process_board(board_id)
+    board = Trello::Board.find(board_id)
+    if last_board_stored == board.id
+      puts "\nUsing last stored board: #{board.name}"
+      scrape_board(board, update: true)
     else
-      puts "Board does not exist. Exiting script."
-      exit
+      puts "\nNew board selected: #{board.name}. Truncating database."
+      truncate_database
+      save_last_board(board.id)
+      scrape_board(board)
     end
   end
 
