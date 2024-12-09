@@ -98,8 +98,10 @@ class TrelloScraper
         card_id TEXT NOT NULL,
         name TEXT NOT NULL,
         location TEXT NOT NULL,
-        phone TEXT NOT NULL,
-        UNIQUE (card_id, name, location, phone)
+        mobile TEXT,
+        landline TEXT,
+        business TEXT,
+        UNIQUE (card_id, name, location, mobile, landline, business),
         FOREIGN KEY(card_id) REFERENCES cards(id)
       );
     SQL
@@ -185,6 +187,25 @@ class TrelloScraper
 
     data_to_scan.each do |text|
       begin
+
+        system_prompt = <<~PROMPT
+          You are an assistant that extracts structured information from text, specifically Australian phone numbers.
+          Identify phone numbers, classify them as Mobile, Landline, or Business, normalize them into the E.164 format,
+          and output the result in the following JSON format:
+          {
+            "name": "John Doe",
+            "location": "Cochrane Rd, Drouin VIC 3818, Australia",
+            "mobile": "e164 format",
+            "landline": "e164 format",
+            "business": "e164 format"
+          }
+        PROMPT
+
+        user_prompt = <<~QUESTION
+          Extract name, location, and phone from the following text:\n#{text}.
+        QUESTION
+
+
         response = @openai_client.chat(
           parameters: {
             model: 'gpt-4o-mini',
@@ -192,11 +213,11 @@ class TrelloScraper
             messages: [
               {
                 role: 'system',
-                content: "You are an assistant that extracts structured information."
+                content: system_prompt
               },
               {
                 role: 'user',
-                content: "Extract name, location, and phone from the following text:\n#{text}. Respond in JSON format."
+                content: user_prompt
               }
             ],
             max_tokens: 100
@@ -213,25 +234,32 @@ class TrelloScraper
         end
 
         # Validate extracted data and skip or log errors as necessary
-        if data[:phone].to_s.strip.empty? ||
-            data[:name].to_s.strip.empty? ||
-            data[:location].to_s.strip.empty? ||
-            [data[:name], data[:location], data[:phone]].any? { |field| %w[N/A not provided Not specified].include?(field.to_s.strip) }
+        if data[:mobile].to_s.strip.empty? &&
+          data[:landline].to_s.strip.empty? &&
+          data[:business].to_s.strip.empty? ||
+          data[:name].to_s.strip.empty? ||
+          data[:location].to_s.strip.empty? ||
+          [data[:name], data[:location], data[:mobile], data[:landline], data[:business]].any? { |field| %w[N/A not provided Not specified].include?(field.to_s.strip) }
           log_error("Skipping invalid or incomplete record for card #{card.id}. Extracted data: #{data.inspect}")
           next
         end
 
+        # Ensure missing phone fields are set to nil
+        data[:mobile] = nil if data[:mobile].to_s.strip.empty?
+        data[:landline] = nil if data[:landline].to_s.strip.empty?
+        data[:business] = nil if data[:business].to_s.strip.empty?
+
         # Check for duplicates
-        existing_contact = @db.get_first_row("SELECT * FROM contacts WHERE card_id = ? AND name = ? AND location = ? AND phone = ?", [
-          card.id, data[:name].strip, data[:location].strip, data[:phone].strip
+        existing_contact = @db.get_first_row("SELECT * FROM contacts WHERE card_id = ? AND name = ? AND location = ? AND (mobile = ? OR landline = ? OR business = ?)", [
+          card.id, data[:name].strip, data[:location].strip, data[:mobile], data[:landline], data[:business]
         ])
         if existing_contact
           log_error("Skipping duplicate record for card #{card.id}. Extracted data: #{data.inspect}")
           next
         end
 
-        # Add to extracted_contacts if all fields are valid
-        extracted_contacts << [card.id, data[:name].strip, data[:location].strip, data[:phone].strip]
+        # Add the valid record
+        extracted_contacts << [card.id, data[:name].strip, data[:location].strip, data[:mobile], data[:landline], data[:business]]
       rescue StandardError => e
         log_error("Error scanning card #{card.id}. Text: #{text}. Error: #{e.message}")
       end
@@ -242,7 +270,7 @@ class TrelloScraper
       @db.execute("BEGIN TRANSACTION;")
       begin
         extracted_contacts.each do |contact|
-          @db.execute("INSERT INTO contacts (card_id, name, location, phone) VALUES (?, ?, ?, ?)", contact)
+          @db.execute("INSERT INTO contacts (card_id, name, location, mobile, landline, business) VALUES (?, ?, ?, ?, ?, ?)", contact)
         end
         @db.execute("COMMIT;")
       rescue StandardError => e
