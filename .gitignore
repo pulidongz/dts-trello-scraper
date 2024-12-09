@@ -1,1 +1,11 @@
+# Env file
 .env
+
+# Logs directory
+/logs/*
+
+# Last board file
+last_board.txt
+
+# Database file
+trello_scraper.db
